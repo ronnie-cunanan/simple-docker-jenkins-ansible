@@ -1,0 +1,70 @@
+---
+# PLAY 1: Build and Push to ECR (Runs on Jenkins Agent)
+- name: Build and Push Docker Image
+  hosts: localhost
+  connection: local
+  tags: ["build"]  # This tag is used in the first Jenkins stage
+  vars:
+    # Variables passed from Jenkins via extraVars
+    aws_region: "{{ aws_region }}"
+    registry: "{{ registry }}"
+    repo_name: "{{ repo_name }}"
+    image_tag: "{{ image_tag | default('latest') }}"
+
+  tasks:
+    - name: Get ECR login password
+      ansible.builtin.shell: "aws ecr get-login-password --region {{ aws_region }}"
+      register: ecr_password
+      no_log: true
+
+    - name: Log in to ECR
+      community.docker.docker_login:
+        registry_url: "{{ registry }}"
+        username: AWS
+        password: "{{ ecr_password.stdout }}"
+
+    - name: Build and push image
+      community.docker.docker_image:
+        build:
+          path: .
+        name: "{{ registry }}/{{ repo_name }}"
+        tag: "{{ image_tag }}"
+        push: yes
+        source: build
+
+# PLAY 2: Deploy to Ubuntu EC2 Instance
+- name: Deploy Container to EC2
+  hosts: ec2_ubuntu
+  become: true
+  tags: ["deploy"]  # This tag is used in the second Jenkins stage
+  vars:
+    aws_region: "{{ aws_region }}"
+    registry: "{{ registry }}"
+    repo_name: "{{ repo_name }}"
+    image_tag: "{{ image_tag | default('latest') }}"
+
+  tasks:
+    - name: Ensure Docker is running
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+
+    - name: Log in to ECR on remote host
+      community.docker.docker_login:
+        registry_url: "{{ registry }}"
+        username: AWS
+        password: "{{ lookup('pipe', 'aws ecr get-login-password --region ' + aws_region) }}"
+
+    - name: Stop and remove old container
+      community.docker.docker_container:
+        name: "{{ repo_name }}"
+        state: absent
+
+    - name: Pull and Run New Container
+      community.docker.docker_container:
+        name: "{{ repo_name }}"
+        image: "{{ registry }}/{{ repo_name }}:{{ image_tag }}"
+        state: started
+        restart_policy: always
+        published_ports:
+          - "8081:5001"  # Map host port 8081 to container port 5001
